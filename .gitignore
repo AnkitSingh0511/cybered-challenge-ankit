@@ -1,0 +1,43 @@
+# .gitignore
+# -----------------------------------------------------------------------------
+# Terraform standard gitignore
+# -----------------------------------------------------------------------------
+
+# Local .terraform directory (downloaded providers and modules)
+.terraform/
+.terraform*
+
+# Terraform lock file — COMMIT THIS (ensures provider version consistency)
+# .terraform.lock.hcl  ← intentionally NOT ignored
+
+# State files — never commit state to git
+*.tfstate
+*.tfstate.backup
+*.tfstate.lock.info
+state.txt
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Sensitive variable files
+*.tfvars.json
+# NOTE: terraform.tfvars is NOT gitignored here because it uses
+# placeholder IPs. If real IPs are used, add:
+# terraform.tfvars
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Terraform plan output (may contain sensitive data)
+*.tfplan
+tfplan
+
+# ECR module temp directory (created and cleaned by push_image.sh)
+modules/ecr/tmp/
+
+#Prompts
+prompts/

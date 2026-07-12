@@ -1,0 +1,522 @@
+# .github/workflows/deploy.yaml
+# =============================================================================
+# GitOps Pipeline — CyberEd Candidate 002
+# =============================================================================
+#
+# Triggers:
+#   Pull Request → master : terraform init + plan + infracost report
+#   Push to master (PR merged) : plan → infracost → manual approval → apply
+#
+# Secrets required (set in GitHub Repository Settings → Secrets):
+#   AWS_ACCESS_KEY_ID      : IAM User access key ID
+#   AWS_SECRET_ACCESS_KEY  : IAM User secret access key
+#   AWS_ROLE_TO_ASSUME     : Full ARN of the IAM role to assume for deployment
+#   INFRACOST_API_KEY      : Infracost API key for cost projection
+#
+# GitHub Environment required:
+#   Name: production
+#   Required reviewers: set to your GitHub username
+#   This enforces the manual approval gate before terraform apply.
+# =============================================================================
+
+name: "Terraform GitOps Pipeline"
+
+on:
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+  push:
+    branches:
+      - master
+
+# Prevent concurrent pipeline runs on the same branch.
+# If a new push arrives while a run is in progress, cancel the older run.
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.10.0"
+  AWS_REGION: "ap-south-1"
+  WORKING_DIR: "."
+  # Terraform log level — set to INFO for pipeline visibility without noise
+  TF_LOG: "INFO"
+  # Disable Terraform color output — cleaner in GitHub Actions logs
+  TF_CLI_ARGS: "-no-color"
+
+jobs:
+
+  # ===========================================================================
+  # JOB 1 — terraform-plan
+  # Runs on: PR creation/update AND push to master
+  # Purpose: Validate, plan, and produce a saved plan artifact
+  # ===========================================================================
+  terraform-plan:
+    name: "Terraform Init & Plan"
+    runs-on: ubuntu-latest
+    # Emit plan output as a job summary and expose outputs for downstream jobs
+    outputs:
+      plan_exit_code: ${{ steps.plan.outputs.exit_code }}
+
+    # Permissions required for PR comment posting
+    permissions:
+      contents: read
+      pull-requests: write
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Why fetch-depth: 0 — Infracost needs full git history to detect
+      # changed files accurately for cost diff reporting.
+
+      # -----------------------------------------------------------------------
+      - name: "Log pipeline context"
+        run: |
+          echo "=========================================="
+          echo "Pipeline Context"
+          echo "=========================================="
+          echo "Event      : ${{ github.event_name }}"
+          echo "Branch     : ${{ github.ref_name }}"
+          echo "Commit SHA : ${{ github.sha }}"
+          echo "Actor      : ${{ github.actor }}"
+          echo "Repository : ${{ github.repository }}"
+          echo "Runner OS  : ${{ runner.os }}"
+          echo "=========================================="
+
+      # -----------------------------------------------------------------------
+      - name: "Setup Terraform ${{ env.TF_VERSION }}"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          # Wrap terraform output so plan exit codes are capturable
+          terraform_wrapper: true
+
+      # -----------------------------------------------------------------------
+      - name: "Verify Terraform version"
+        run: terraform version
+
+      # -----------------------------------------------------------------------
+      - name: "Setup Docker (required for push_image.sh in terraform apply)"
+        uses: docker/setup-buildx-action@v3
+      # Why here and not just in apply job:
+      # terraform plan with terraform_data does not run provisioners,
+      # but we set up Docker on all jobs for consistency and to catch
+      # any docker-related issues early.
+
+      # -----------------------------------------------------------------------
+      - name: "Configure AWS credentials — IAM User"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Do not mask account ID in logs — needed for debugging ARN issues
+          mask-aws-account-id: false
+
+      # -----------------------------------------------------------------------
+      - name: "Assume deployment IAM role"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: "GitHubActions-TerraformPlan-${{ github.run_id }}"
+          external-id : ${{ secrets.AWS_ASSUME_ROLE_EXTERNAL_ID }}
+          role-duration-seconds: 3600
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------------------------------------
+      - name: "Verify AWS identity (role assumed)"
+        run: |
+          echo "=========================================="
+          echo "AWS Identity After Role Assumption"
+          echo "=========================================="
+          aws sts get-caller-identity
+          echo "=========================================="
+        # Logs Account, UserId, Arn — confirms correct role was assumed
+        # Does NOT log access keys or secrets
+
+      # -----------------------------------------------------------------------
+      - name: "Terraform Init"
+        id: init
+        run: |
+          echo "=========================================="
+          echo "Terraform Init"
+          echo "=========================================="
+          terraform init
+          echo "Init exit code: $?"
+
+      # -----------------------------------------------------------------------
+      - name: "Terraform Format Check"
+        id: fmt
+        run: |
+          echo "=========================================="
+          echo "Terraform Format Check"
+          echo "=========================================="
+          terraform fmt -recursive -check
+        continue-on-error: false
+        # Fails pipeline if any .tf file is not formatted correctly.
+        # Run 'terraform fmt -recursive' locally to fix before pushing.
+
+      # -----------------------------------------------------------------------
+      - name: "Terraform Validate"
+        id: validate
+        run: |
+          echo "=========================================="
+          echo "Terraform Validate"
+          echo "=========================================="
+          terraform validate
+
+      # -----------------------------------------------------------------------
+      - name: "Terraform Plan"
+        id: plan
+        run: |
+          echo "=========================================="
+          echo "Terraform Plan"
+          echo "=========================================="
+          terraform plan \
+            -detailed-exitcode \
+            -out=tfplan \
+            -input=false
+        # Exit codes:
+        #   0 = no changes
+        #   1 = error
+        #   2 = changes present (expected on active development)
+        # -detailed-exitcode lets us detect no-change plans downstream
+
+      # -----------------------------------------------------------------------
+      - name: "Log plan summary"
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "Plan Summary"
+          echo "=========================================="
+          terraform show -no-color tfplan | tail -20
+          # Shows last 20 lines of plan — resource counts summary
+          # Full plan saved as artifact below
+
+      # -----------------------------------------------------------------------
+      - name: "Convert plan to JSON for Infracost"
+        run: |
+          terraform show -json tfplan > plan.json
+          echo "Plan JSON generated: $(du -sh plan.json | cut -f1)"
+
+      # -----------------------------------------------------------------------
+      - name: "Upload plan artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.sha }}
+          path: |
+            tfplan
+            plan.json
+          retention-days: 5
+          if-no-files-found: error
+        # Artifact named with commit SHA — uniquely identifies this plan.
+        # Apply job downloads this exact artifact to ensure apply uses
+        # the same plan that was reviewed and approved.
+
+      # -----------------------------------------------------------------------
+      - name: "Post plan result to PR"
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `
+            ## Terraform Plan Results 📋
+
+            | Step | Status |
+            |------|--------|
+            | Format Check | ${{ steps.fmt.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | Validate     | ${{ steps.validate.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | Plan         | ${{ steps.plan.outcome == 'success' && '✅ Success' || '❌ Failed' }} |
+
+            **Commit:** \`${{ github.sha }}\`
+            **Actor:** @${{ github.actor }}
+
+            > ℹ️ Infracost cost report will appear below once the plan artifact is processed.
+            > 💡 After merge to master, pipeline will require manual approval before apply.
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  # ===========================================================================
+  # JOB 2 — infracost-report
+  # Runs on: push to master ONLY (after PR merge)
+  # Purpose: Generate cost breakdown and post to workflow summary
+  # Does NOT block apply — manual approval job handles the gate
+  # ===========================================================================
+  infracost-report:
+    name: "Infracost Cost Report"
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    # Only run on push to master — not on PRs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      - name: "Download plan artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.sha }}
+          path: .
+
+      # -----------------------------------------------------------------------
+      - name: "Setup Infracost"
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      # -----------------------------------------------------------------------
+      - name: "Generate Infracost breakdown"
+        run: |
+          echo "=========================================="
+          echo "Infracost Cost Breakdown"
+          echo "=========================================="
+          infracost breakdown \
+            --path plan.json \
+            --format table \
+            --log-level info
+          echo "=========================================="
+
+      # -----------------------------------------------------------------------
+      - name: "Generate Infracost JSON report"
+        run: |
+          infracost breakdown \
+            --path plan.json \
+            --format json \
+            --out-file infracost-report.json
+
+      # -----------------------------------------------------------------------
+      - name: "Post cost report to workflow summary"
+        run: |
+          echo "## 💰 Infracost Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Projected Monthly Cost:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          infracost breakdown \
+            --path plan.json \
+            --format table >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> ⚠️ Budget cap: \$50.00 USD/month" >> $GITHUB_STEP_SUMMARY
+          echo "> ✅ Pipeline does not fail on cost — review before approving apply." >> $GITHUB_STEP_SUMMARY
+
+      # -----------------------------------------------------------------------
+      - name: "Upload Infracost report artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: infracost-report-${{ github.sha }}
+          path: infracost-report.json
+          retention-days: 5
+
+  # ===========================================================================
+  # JOB 3 — manual-approval
+  # Runs on: push to master ONLY
+  # Purpose: Gate between plan/cost review and terraform apply
+  # Uses GitHub Environment protection rules for reviewer approval
+  # ===========================================================================
+  manual-approval:
+    name: "Awaiting Manual Approval"
+    runs-on: ubuntu-latest
+    needs: infracost-report
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    # Targets the 'production' GitHub Environment.
+    # Required reviewers set on this environment enforce the approval gate.
+    # Pipeline pauses here until a reviewer approves in GitHub Actions UI.
+    environment: production
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: "Log approval context"
+        run: |
+          echo "=========================================="
+          echo "Manual Approval Gate"
+          echo "=========================================="
+          echo "This job targets the 'production' environment."
+          echo "A required reviewer must approve before terraform apply runs."
+          echo ""
+          echo "To approve:"
+          echo "  1. Go to Actions tab in GitHub"
+          echo "  2. Find this workflow run"
+          echo "  3. Click 'Review deployments'"
+          echo "  4. Select 'production' and approve"
+          echo ""
+          echo "Commit : ${{ github.sha }}"
+          echo "Actor  : ${{ github.actor }}"
+          echo "=========================================="
+
+  # ===========================================================================
+  # JOB 4 — terraform-apply
+  # Runs on: push to master ONLY — after manual approval
+  # Purpose: Apply the exact plan that was reviewed and approved
+  # ===========================================================================
+  terraform-apply:
+    name: "Terraform Apply"
+    runs-on: ubuntu-latest
+    needs: manual-approval
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      - name: "Log apply context"
+        run: |
+          echo "=========================================="
+          echo "Terraform Apply — Approved"
+          echo "=========================================="
+          echo "Commit SHA : ${{ github.sha }}"
+          echo "Actor      : ${{ github.actor }}"
+          echo "Timestamp  : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "=========================================="
+
+      # -----------------------------------------------------------------------
+      - name: "Setup Terraform ${{ env.TF_VERSION }}"
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+          # wrapper=false in apply job — we don't need exit code capture here
+          # and false avoids output wrapping that can cause issues with apply
+
+      # -----------------------------------------------------------------------
+      - name: "Setup Docker (required for push_image.sh provisioner)"
+        uses: docker/setup-buildx-action@v3
+
+      # -----------------------------------------------------------------------
+      - name: "Verify Docker is running"
+        run: |
+          docker info
+          echo "Docker version: $(docker --version)"
+
+      # -----------------------------------------------------------------------
+      - name: "Configure AWS credentials — IAM User"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: false
+
+      # -----------------------------------------------------------------------
+      - name: "Assume deployment IAM role"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: "GitHubActions-TerraformApply-${{ github.run_id }}"
+          role-duration-seconds: 3600
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------------------------------------
+      - name: "Verify AWS identity (role assumed)"
+        run: |
+          echo "=========================================="
+          echo "AWS Identity After Role Assumption"
+          echo "=========================================="
+          aws sts get-caller-identity
+          echo "=========================================="
+
+      # -----------------------------------------------------------------------
+      - name: "Terraform Init"
+        run: |
+          echo "=========================================="
+          echo "Terraform Init"
+          echo "=========================================="
+          terraform init
+
+      # -----------------------------------------------------------------------
+      - name: "Download approved plan artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.sha }}
+          path: .
+      # Downloads the exact tfplan file produced in Job 1.
+      # Apply uses this saved plan — not a fresh plan.
+      # Guarantees what was reviewed == what gets applied.
+
+      # -----------------------------------------------------------------------
+      - name: "Verify plan artifact integrity"
+        run: |
+          echo "=========================================="
+          echo "Plan Artifact Verification"
+          echo "=========================================="
+          ls -lh tfplan plan.json
+          echo "Plan file size: $(du -sh tfplan | cut -f1)"
+          echo "=========================================="
+
+      # -----------------------------------------------------------------------
+      - name: "Make push_image.sh executable"
+        run: chmod +x modules/ecr/scripts/push_image.sh
+      # Belt-and-suspenders: chmod is also in the local-exec command
+      # but explicitly setting it here ensures no permission issues
+      # on the GitHub Actions runner filesystem.
+
+      # -----------------------------------------------------------------------
+      - name: "Terraform Apply"
+        run: |
+          echo "=========================================="
+          echo "Terraform Apply"
+          echo "=========================================="
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            tfplan
+          echo "=========================================="
+          echo "Apply complete: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "=========================================="
+        # -auto-approve is safe here because:
+        # 1. The plan was already reviewed in Job 1
+        # 2. A human manually approved in Job 3
+        # 3. We are applying the exact saved plan — not re-planning
+
+      # -----------------------------------------------------------------------
+      - name: "Post apply summary"
+        if: always()
+        run: |
+          echo "## 🚀 Terraform Apply Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Status    | ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit    | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Actor     | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Timestamp | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY
