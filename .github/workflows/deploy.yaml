@@ -19,7 +19,7 @@
 #   This enforces the manual approval gate before terraform apply.
 # =============================================================================
 
-name: "Terraform GitOps Pipeline"
+name: "Terraform GitOps Pipeline 🚀"
 
 on:
   pull_request:
