@@ -75,13 +75,13 @@ resource "aws_ecs_task_definition" "student" {
       #   }
       # }
 
-    #   healthCheck = {
-    #     command     = ["CMD-SHELL", "curl -k https://localhost:6901/ || exit 1"]
-    #     interval    = 30
-    #     timeout     = 5
-    #     retries     = 3
-    #     startPeriod = 300
-    #   }
+      #   healthCheck = {
+      #     command     = ["CMD-SHELL", "curl -k https://localhost:6901/ || exit 1"]
+      #     interval    = 30
+      #     timeout     = 5
+      #     retries     = 3
+      #     startPeriod = 300
+      #   }
     }
   ])
 

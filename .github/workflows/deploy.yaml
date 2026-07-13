@@ -19,7 +19,7 @@
 #   This enforces the manual approval gate before terraform apply.
 # =============================================================================
 
-name: "Terraform GitOps Pipeline"
+name: "Terraform GitOps Pipeline 🚀"
 
 on:
   pull_request:
@@ -41,7 +41,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TF_VERSION: "1.10.0"
+  TF_VERSION: "1.15.0"
   AWS_REGION: "ap-south-1"
   WORKING_DIR: "."
   # Terraform log level — set to INFO for pipeline visibility without noise
@@ -116,26 +116,18 @@ jobs:
       # any docker-related issues early.
 
       # -----------------------------------------------------------------------
-      - name: "Configure AWS credentials — IAM User"
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-          # Do not mask account ID in logs — needed for debugging ARN issues
-          mask-aws-account-id: false
-
-      # -----------------------------------------------------------------------
       - name: "Assume deployment IAM role"
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          role-session-name: "GitHubActions-TerraformPlan-${{ github.run_id }}"
-          external-id : ${{ secrets.AWS_ASSUME_ROLE_EXTERNAL_ID }}
+          role-external-id: ${{ secrets.AWS_ASSUME_ROLE_EXTERNAL_ID }}
+          role-session-name: "cybered-build"
           role-duration-seconds: 3600
           aws-region: ${{ env.AWS_REGION }}
+          force-skip-oidc: true
+          role-skip-session-tagging: true
 
       # -----------------------------------------------------------------------
       - name: "Verify AWS identity (role assumed)"
@@ -427,24 +419,18 @@ jobs:
           echo "Docker version: $(docker --version)"
 
       # -----------------------------------------------------------------------
-      - name: "Configure AWS credentials — IAM User"
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-          mask-aws-account-id: false
-
-      # -----------------------------------------------------------------------
       - name: "Assume deployment IAM role"
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          role-session-name: "GitHubActions-TerraformApply-${{ github.run_id }}"
+          role-external-id: ${{ secrets.AWS_ASSUME_ROLE_EXTERNAL_ID }}
+          role-session-name: "cybered-build"
           role-duration-seconds: 3600
           aws-region: ${{ env.AWS_REGION }}
+          force-skip-oidc: true
+          role-skip-session-tagging: true
 
       # -----------------------------------------------------------------------
       - name: "Verify AWS identity (role assumed)"
