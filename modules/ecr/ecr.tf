@@ -31,6 +31,8 @@ resource "aws_ecr_repository" "student" {
     encryption_type = "AES256"
   }
 
+  force_delete = true
+
   tags = {
     name  = "${var.prefix}-ecr-${each.value.id}"
     owner = each.value.id
