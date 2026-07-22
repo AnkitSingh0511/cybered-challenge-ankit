@@ -7,16 +7,7 @@
 
 aws_region = "ap-south-1"
 
-students = [
-  {
-    id            = "student-01"
-    authorized_ip = "182.48.215.138/32" # Replace with actual student-01 IP before apply
-  },
-  {
-    id            = "student-02"
-    authorized_ip = "182.48.215.138/32" # Replace with actual student-02 IP before apply
-  }
-]
+students = []
 
 fargate_capacity_provider = "FARGATE_SPOT"
 
